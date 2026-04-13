@@ -4,22 +4,27 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "party:dev": "partykit dev",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"
   },
   "dependencies": {
     "next": "16.2.3",
+    "partysocket": "^1.1.16",
     "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "simple-peer": "^9.11.1"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@types/simple-peer": "^9.11.9",
     "eslint": "^9",
     "eslint-config-next": "16.2.3",
+    "partykit": "^0.0.115",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

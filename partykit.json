@@ -1,0 +1,5 @@
+{
+  "name": "side-by-side",
+  "main": "party/watch-room.ts",
+  "compatibilityDate": "2024-10-01"
+}
