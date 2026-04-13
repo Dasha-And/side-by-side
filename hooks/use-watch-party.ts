@@ -31,6 +31,14 @@ function isRtcMessage(x: unknown): x is RtcMessage {
   );
 }
 
+/** Public STUN helps peers find each other across NAT; required for most non-localhost use. */
+const DEFAULT_PEER_RTC_CONFIG: RTCConfiguration = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+  ],
+};
+
 function isPartyVideoMessage(x: unknown): x is PartyVideoMessage {
   if (typeof x !== "object" || x === null || (x as { type?: string }).type !== "video") {
     return false;
@@ -62,6 +70,8 @@ export function useWatchParty(options: {
   const [hostPeerId, setHostPeerId] = useState<string | null>(null);
   const [sortedPeerIds, setSortedPeerIds] = useState<string[]>([]);
   const [remoteStreams, setRemoteStreams] = useState<Map<string, MediaStream>>(new Map());
+  /** Bumped when a remote peer toggles media so we tear down and re-negotiate WebRTC. */
+  const [rtcRefreshEpoch, setRtcRefreshEpoch] = useState(0);
 
   const socketRef = useRef<PartySocket | null>(null);
   const peersRef = useRef<Map<string, PeerInstance>>(new Map());
@@ -117,6 +127,14 @@ export function useWatchParty(options: {
           onVideoPartyMessageRef.current(data);
           return;
         }
+        if (
+          typeof data === "object" &&
+          data !== null &&
+          (data as { type?: string }).type === "media-renegotiate"
+        ) {
+          setRtcRefreshEpoch((e) => e + 1);
+          return;
+        }
         if (isRtcMessage(data)) {
           const target = myPeerIdRef.current;
           if (target && data.to === target) {
@@ -148,6 +166,7 @@ export function useWatchParty(options: {
       setHostPeerId(null);
       setSortedPeerIds([]);
       setRemoteStreams(new Map());
+      setRtcRefreshEpoch(0);
     };
   }, [roomId]);
 
@@ -195,10 +214,19 @@ export function useWatchParty(options: {
       peersRef.current.clear();
       setRemoteStreams(new Map());
 
+      const attachRemoteStream = (remotePeerId: string, stream: MediaStream) => {
+        setRemoteStreams((prev) => {
+          const next = new Map(prev);
+          next.set(remotePeerId, stream);
+          return next;
+        });
+      };
+
       for (const remoteId of remotes) {
         const opts: PeerOptions = {
           initiator: myId < remoteId,
           trickle: true,
+          config: DEFAULT_PEER_RTC_CONFIG,
         };
         if (localStream) {
           opts.stream = localStream;
@@ -217,11 +245,11 @@ export function useWatchParty(options: {
         });
 
         peer.on("stream", (stream: MediaStream) => {
-          setRemoteStreams((prev) => {
-            const next = new Map(prev);
-            next.set(remoteId, stream);
-            return next;
-          });
+          attachRemoteStream(remoteId, stream);
+        });
+
+        peer.on("track", (_track: MediaStreamTrack, stream: MediaStream) => {
+          attachRemoteStream(remoteId, stream);
         });
 
         peer.on("close", () => {
@@ -252,7 +280,19 @@ export function useWatchParty(options: {
       }
       peersRef.current.clear();
     };
-  }, [sortedPeerIds.join(","), myPeerId, buildLocalRtcStream]);
+  }, [sortedPeerIds.join(","), myPeerId, buildLocalRtcStream, rtcRefreshEpoch]);
+
+  /** When our media or roster changes, tell others to re-create RTCPeerConnections (they won't see new tracks otherwise). */
+  useEffect(() => {
+    if (myPeerId === null || sortedPeerIds.length <= 1) {
+      return;
+    }
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    socket.send(JSON.stringify({ type: "media-renegotiate" }));
+  }, [isMicOn, isCameraOn, myPeerId, sortedPeerIds.length]);
 
   const sendVideoParty = useCallback((msg: PartyVideoMessage) => {
     socketRef.current?.send(JSON.stringify(msg));

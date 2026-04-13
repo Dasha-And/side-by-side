@@ -326,6 +326,7 @@ function RemotePeerMedia({ stream }: { stream: MediaStream }) {
       ref={ref}
       autoPlay
       playsInline
+      muted={false}
       className="absolute inset-0 h-full w-full object-cover"
     />
   );
