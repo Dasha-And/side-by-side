@@ -308,18 +308,32 @@ function MicVisualizer({ level }: { level: number }) {
 
 function RemotePeerMedia({ stream }: { stream: MediaStream }) {
   const ref = useRef<HTMLVideoElement | null>(null);
+  const trackKey = stream
+    .getTracks()
+    .map((t) => `${t.id}:${t.readyState}`)
+    .join("|");
 
   useEffect(() => {
     const el = ref.current;
     if (!el) {
       return;
     }
-    el.srcObject = stream;
-    void el.play().catch(() => undefined);
+
+    const bind = () => {
+      el.srcObject = stream;
+      void el.play().catch(() => undefined);
+    };
+
+    bind();
+    stream.addEventListener("addtrack", bind);
+    stream.addEventListener("removetrack", bind);
+
     return () => {
+      stream.removeEventListener("addtrack", bind);
+      stream.removeEventListener("removetrack", bind);
       el.srcObject = null;
     };
-  }, [stream]);
+  }, [stream, trackKey]);
 
   return (
     <video

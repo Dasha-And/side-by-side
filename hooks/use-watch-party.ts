@@ -39,6 +39,8 @@ const DEFAULT_PEER_RTC_CONFIG: RTCConfiguration = {
   ],
 };
 
+const MEDIA_SYNC_DEBOUNCE_MS = 120;
+
 function isPartyVideoMessage(x: unknown): x is PartyVideoMessage {
   if (typeof x !== "object" || x === null || (x as { type?: string }).type !== "video") {
     return false;
@@ -57,6 +59,38 @@ function isPartyVideoMessage(x: unknown): x is PartyVideoMessage {
   return false;
 }
 
+function syncPeerOutboundMedia(peer: PeerInstance, outbound: MediaStream | null) {
+  const want =
+    outbound && outbound.getTracks().length > 0 ? new Set(outbound.getTracks()) : new Set<MediaStreamTrack>();
+
+  for (const stream of [...peer.streams]) {
+    for (const t of [...stream.getTracks()]) {
+      if (!want.has(t)) {
+        try {
+          peer.removeTrack(t, stream);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+
+  if (!outbound || want.size === 0) {
+    return;
+  }
+
+  const current = new Set(peer.streams.flatMap((s) => s.getTracks()));
+  for (const t of outbound.getTracks()) {
+    if (!current.has(t)) {
+      try {
+        peer.addTrack(t, outbound);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
 export function useWatchParty(options: {
   roomId: string;
   isMicOn: boolean;
@@ -70,14 +104,15 @@ export function useWatchParty(options: {
   const [hostPeerId, setHostPeerId] = useState<string | null>(null);
   const [sortedPeerIds, setSortedPeerIds] = useState<string[]>([]);
   const [remoteStreams, setRemoteStreams] = useState<Map<string, MediaStream>>(new Map());
-  /** Bumped when a remote peer toggles media so we tear down and re-negotiate WebRTC. */
-  const [rtcRefreshEpoch, setRtcRefreshEpoch] = useState(0);
 
   const socketRef = useRef<PartySocket | null>(null);
   const peersRef = useRef<Map<string, PeerInstance>>(new Map());
   const myPeerIdRef = useRef<string | null>(null);
   const hostPeerIdRef = useRef<string | null>(null);
   const sortedPeerIdsRef = useRef<string[]>([]);
+  /** Single outbound stream object so addTrack/removeTrack stays consistent across the mesh. */
+  const outboundStreamRef = useRef<MediaStream | null>(null);
+  const mediaSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const onVideoPartyMessageRef = useRef<(msg: PartyVideoMessage) => void>(() => {});
 
@@ -97,8 +132,50 @@ export function useWatchParty(options: {
     sortedPeerIdsRef.current = sortedPeerIds;
   }, [sortedPeerIds]);
 
+  const ensureOutboundStream = useCallback((): MediaStream | null => {
+    const tracks: MediaStreamTrack[] = [];
+    if (isMicOn && micStreamRef.current) {
+      tracks.push(...micStreamRef.current.getAudioTracks());
+    }
+    if (isCameraOn && cameraStreamRef.current) {
+      tracks.push(...cameraStreamRef.current.getVideoTracks());
+    }
+
+    if (tracks.length === 0) {
+      const s = outboundStreamRef.current;
+      if (s) {
+        for (const t of [...s.getTracks()]) {
+          s.removeTrack(t);
+        }
+      }
+      outboundStreamRef.current = null;
+      return null;
+    }
+
+    let s = outboundStreamRef.current;
+    if (!s) {
+      s = new MediaStream();
+      outboundStreamRef.current = s;
+    }
+
+    for (const t of [...s.getTracks()]) {
+      if (!tracks.includes(t)) {
+        s.removeTrack(t);
+      }
+    }
+    for (const t of tracks) {
+      if (!s.getTracks().includes(t)) {
+        s.addTrack(t);
+      }
+    }
+
+    return s;
+  }, [isMicOn, isCameraOn, micStreamRef, cameraStreamRef]);
+
+  const ensureOutboundStreamRef = useRef(ensureOutboundStream);
+  ensureOutboundStreamRef.current = ensureOutboundStream;
+
   useEffect(() => {
-    // PartyKit maps `partykit.json` `main` to the party name "main" (not the file path).
     const socket = new PartySocket({
       host: getPartyKitHost(),
       room: roomId,
@@ -127,14 +204,6 @@ export function useWatchParty(options: {
           onVideoPartyMessageRef.current(data);
           return;
         }
-        if (
-          typeof data === "object" &&
-          data !== null &&
-          (data as { type?: string }).type === "media-renegotiate"
-        ) {
-          setRtcRefreshEpoch((e) => e + 1);
-          return;
-        }
         if (isRtcMessage(data)) {
           const target = myPeerIdRef.current;
           if (target && data.to === target) {
@@ -160,29 +229,19 @@ export function useWatchParty(options: {
       }
       peersRef.current.clear();
       myPeerIdRef.current = null;
+      outboundStreamRef.current = null;
       socket.close();
       socketRef.current = null;
       setMyPeerId(null);
       setHostPeerId(null);
       setSortedPeerIds([]);
       setRemoteStreams(new Map());
-      setRtcRefreshEpoch(0);
+      if (mediaSyncTimerRef.current !== null) {
+        clearTimeout(mediaSyncTimerRef.current);
+        mediaSyncTimerRef.current = null;
+      }
     };
   }, [roomId]);
-
-  const buildLocalRtcStream = useCallback(() => {
-    const tracks: MediaStreamTrack[] = [];
-    if (isMicOn && micStreamRef.current) {
-      tracks.push(...micStreamRef.current.getAudioTracks());
-    }
-    if (isCameraOn && cameraStreamRef.current) {
-      tracks.push(...cameraStreamRef.current.getVideoTracks());
-    }
-    if (tracks.length === 0) {
-      return null;
-    }
-    return new MediaStream(tracks);
-  }, [isMicOn, isCameraOn, micStreamRef, cameraStreamRef]);
 
   useEffect(() => {
     const run = () => {
@@ -201,8 +260,16 @@ export function useWatchParty(options: {
       }
 
       const socket = socketRef.current;
-      const localStream = buildLocalRtcStream();
       const remotes = sortedPeerIdsRef.current.filter((id) => id !== myId);
+      setRemoteStreams((prev) => {
+        const next = new Map(prev);
+        for (const id of prev.keys()) {
+          if (!remotes.includes(id)) {
+            next.delete(id);
+          }
+        }
+        return next;
+      });
 
       for (const p of peersRef.current.values()) {
         try {
@@ -212,7 +279,8 @@ export function useWatchParty(options: {
         }
       }
       peersRef.current.clear();
-      setRemoteStreams(new Map());
+
+      const outbound = ensureOutboundStreamRef.current();
 
       const attachRemoteStream = (remotePeerId: string, stream: MediaStream) => {
         setRemoteStreams((prev) => {
@@ -228,8 +296,8 @@ export function useWatchParty(options: {
           trickle: true,
           config: DEFAULT_PEER_RTC_CONFIG,
         };
-        if (localStream) {
-          opts.stream = localStream;
+        if (outbound && outbound.getTracks().length > 0) {
+          opts.stream = outbound;
         }
         const peer = new Peer(opts);
 
@@ -280,19 +348,32 @@ export function useWatchParty(options: {
       }
       peersRef.current.clear();
     };
-  }, [sortedPeerIds.join(","), myPeerId, buildLocalRtcStream, rtcRefreshEpoch]);
+  }, [sortedPeerIds.join(","), myPeerId]);
 
-  /** When our media or roster changes, tell others to re-create RTCPeerConnections (they won't see new tracks otherwise). */
   useEffect(() => {
-    if (myPeerId === null || sortedPeerIds.length <= 1) {
+    if (myPeerId === null || peersRef.current.size === 0) {
       return;
     }
-    const socket = socketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      return;
+
+    if (mediaSyncTimerRef.current !== null) {
+      clearTimeout(mediaSyncTimerRef.current);
     }
-    socket.send(JSON.stringify({ type: "media-renegotiate" }));
-  }, [isMicOn, isCameraOn, myPeerId, sortedPeerIds.length]);
+
+    mediaSyncTimerRef.current = setTimeout(() => {
+      mediaSyncTimerRef.current = null;
+      const outbound = ensureOutboundStreamRef.current();
+      for (const peer of peersRef.current.values()) {
+        syncPeerOutboundMedia(peer, outbound);
+      }
+    }, MEDIA_SYNC_DEBOUNCE_MS);
+
+    return () => {
+      if (mediaSyncTimerRef.current !== null) {
+        clearTimeout(mediaSyncTimerRef.current);
+        mediaSyncTimerRef.current = null;
+      }
+    };
+  }, [isMicOn, isCameraOn, myPeerId, sortedPeerIds.join(",")]);
 
   const sendVideoParty = useCallback((msg: PartyVideoMessage) => {
     socketRef.current?.send(JSON.stringify(msg));
