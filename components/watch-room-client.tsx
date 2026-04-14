@@ -8,6 +8,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { useRouter } from "next/navigation";
 
 import { useWatchParty } from "@/hooks/use-watch-party";
 
@@ -382,6 +383,8 @@ export function WatchRoomClient({ roomId }: { roomId: string }) {
   const applyingRemoteVideoRef = useRef(false);
   const prevPeerCountForVideoRef = useRef(0);
   const [inviteCopied, setInviteCopied] = useState(false);
+  const [showLeaveRoomModal, setShowLeaveRoomModal] = useState(false);
+  const router = useRouter();
 
   useEffect(() => {
     movieUrlRef.current = movieUrl;
@@ -395,6 +398,22 @@ export function WatchRoomClient({ roomId }: { roomId: string }) {
       micStreamRef,
       cameraStreamRef: streamRef,
     });
+
+  const isLastUserInRoom =
+    myPeerId !== null && sortedPeerIds.length === 1 && sortedPeerIds[0] === myPeerId;
+
+  useEffect(() => {
+    if (!isLastUserInRoom) {
+      return;
+    }
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue =
+        "You are the only person in this room. Leaving will end the room for everyone.";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [isLastUserInRoom]);
 
   const stopMic = () => {
     if (micFrameRef.current !== null) {
@@ -1230,7 +1249,54 @@ export function WatchRoomClient({ roomId }: { roomId: string }) {
         >
           {inviteCopied ? "Invite link copied" : "Invite users"}
         </button>
+        {isLastUserInRoom ? (
+          <button
+            type="button"
+            onClick={() => setShowLeaveRoomModal(true)}
+            className="mt-2 w-full rounded-xl border border-white/35 bg-transparent px-4 py-2.5 text-sm font-medium text-white/85 transition hover:bg-white/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-white/50"
+          >
+            Leave room
+          </button>
+        ) : null}
       </aside>
+
+      {showLeaveRoomModal ? (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 p-4">
+          <div
+            className="w-full max-w-md rounded-2xl border border-white/20 bg-[#2c153f] p-6 text-white shadow-2xl"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="leave-room-title"
+          >
+            <h3 id="leave-room-title" className="text-lg font-semibold">
+              This room will now be deleted
+            </h3>
+            <p className="mt-3 text-sm text-white/80">
+              You are the only person here. If you leave, this watch room ends and the link will
+              stop working for everyone.
+            </p>
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setShowLeaveRoomModal(false)}
+                className="rounded-lg border border-white/30 px-4 py-2 text-sm text-white/90"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowLeaveRoomModal(false);
+                  router.push("/");
+                }}
+                className="rounded-lg bg-white px-4 py-2 text-sm font-semibold text-violet-900"
+              >
+                OK
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

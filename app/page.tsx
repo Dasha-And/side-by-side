@@ -1,5 +1,7 @@
+"use client";
+
 import { Barlow_Condensed } from "next/font/google";
-import Link from "next/link";
+import { useRouter } from "next/navigation";
 
 const logoFont = Barlow_Condensed({
   subsets: ["latin"],
@@ -8,6 +10,8 @@ const logoFont = Barlow_Condensed({
 });
 
 export default function Home() {
+  const router = useRouter();
+
   return (
     <div
       className="relative flex min-h-screen items-center justify-center"
@@ -31,13 +35,16 @@ export default function Home() {
         </div>
       </div>
 
-      <Link
-        href="/room"
+      <button
+        type="button"
+        onClick={() => {
+          router.push(`/room/${crypto.randomUUID()}`);
+        }}
         className="inline-flex cursor-pointer items-center gap-3 rounded-2xl border border-white/35 bg-white/10 px-10 py-5 text-xl font-semibold text-white shadow-2xl backdrop-blur-sm transition hover:bg-white/20 focus:outline-none focus-visible:ring-2 focus-visible:ring-white/70"
       >
         <span className="text-3xl leading-none">+</span>
         <span>Create new room</span>
-      </Link>
+      </button>
     </div>
   );
 }
