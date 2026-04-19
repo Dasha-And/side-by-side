@@ -363,6 +363,8 @@ export function WatchRoomClient({ roomId }: { roomId: string }) {
   const [rejectedFileName, setRejectedFileName] = useState("");
   const [movieProgressLabel, setMovieProgressLabel] = useState("");
   const [showLinkModal, setShowLinkModal] = useState(false);
+  /** `replace`: changing video while one is already playing (aside); `pick`: initial play from link. */
+  const [linkModalMode, setLinkModalMode] = useState<"pick" | "replace">("pick");
   const [linkUrlInput, setLinkUrlInput] = useState("");
   const [linkModalError, setLinkModalError] = useState("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -731,11 +733,11 @@ export function WatchRoomClient({ roomId }: { roomId: string }) {
   }, [sortedPeerIds.length, isHost, sendVideoParty]);
 
   useEffect(() => {
-    if (!isHost) {
+    if (!movieUrl) {
       return;
     }
     const v = moviePlayerRef.current;
-    if (!v || !movieUrl) {
+    if (!v) {
       return;
     }
 
@@ -755,13 +757,16 @@ export function WatchRoomClient({ roomId }: { roomId: string }) {
     v.addEventListener("play", send);
     v.addEventListener("pause", send);
     v.addEventListener("seeked", send);
-    const id = window.setInterval(send, 2500);
+
+    const intervalId = isHost ? window.setInterval(send, 2500) : undefined;
 
     return () => {
       v.removeEventListener("play", send);
       v.removeEventListener("pause", send);
       v.removeEventListener("seeked", send);
-      window.clearInterval(id);
+      if (intervalId !== undefined) {
+        window.clearInterval(intervalId);
+      }
     };
   }, [isHost, movieUrl, sendVideoParty]);
 
@@ -777,6 +782,7 @@ export function WatchRoomClient({ roomId }: { roomId: string }) {
 
     setShowLinkModal(false);
     setLinkUrlInput("");
+    setLinkModalMode("pick");
   };
 
   const handleMovieSelect = (event: ChangeEvent<HTMLInputElement>) => {
@@ -959,7 +965,7 @@ export function WatchRoomClient({ roomId }: { roomId: string }) {
             <video
               ref={moviePlayerRef}
               src={movieUrl}
-              controls={isHost}
+              controls
               onLoadedData={handleMovieLoaded}
               onPlay={() => {
                 syncMovieAudioState();
@@ -1013,6 +1019,7 @@ export function WatchRoomClient({ roomId }: { roomId: string }) {
                 onClick={() => {
                   setLinkModalError("");
                   setLinkUrlInput("");
+                  setLinkModalMode("pick");
                   setShowLinkModal(true);
                 }}
                 className="inline-flex cursor-pointer items-center rounded-xl border border-white/80 bg-white/10 px-6 py-3 text-lg font-semibold text-white shadow-lg backdrop-blur-sm transition hover:bg-white/20 focus:outline-none focus-visible:ring-2 focus-visible:ring-white/70"
@@ -1087,11 +1094,12 @@ export function WatchRoomClient({ roomId }: { roomId: string }) {
                 aria-labelledby="link-modal-title"
               >
                 <h3 id="link-modal-title" className="text-lg font-semibold">
-                  Play from a link
+                  {linkModalMode === "replace" ? "Change video from link" : "Play from a link"}
                 </h3>
                 <p className="mt-2 text-sm text-white/80">
-                  Paste a direct link to a video file (for example an .mp4 URL). Some hosts block
-                  playback in the browser.
+                  {linkModalMode === "replace"
+                    ? "Paste a new direct link to replace the video for everyone in this room. Some hosts block playback in the browser."
+                    : "Paste a direct link to a video file (for example an .mp4 URL). Some hosts block playback in the browser."}
                 </p>
                 <form onSubmit={handlePlayFromLinkSubmit} className="mt-4">
                   <label htmlFor="video-link-url" className="sr-only">
@@ -1121,6 +1129,7 @@ export function WatchRoomClient({ roomId }: { roomId: string }) {
                         setShowLinkModal(false);
                         setLinkUrlInput("");
                         setLinkModalError("");
+                        setLinkModalMode("pick");
                       }}
                       className="rounded-lg border border-white/30 px-4 py-2 text-sm text-white/90"
                     >
@@ -1130,7 +1139,7 @@ export function WatchRoomClient({ roomId }: { roomId: string }) {
                       type="submit"
                       className="rounded-lg bg-white px-4 py-2 text-sm font-semibold text-violet-900"
                     >
-                      Play
+                      {linkModalMode === "replace" ? "Replace video" : "Play"}
                     </button>
                   </div>
                 </form>
@@ -1249,6 +1258,25 @@ export function WatchRoomClient({ roomId }: { roomId: string }) {
         >
           {inviteCopied ? "Invite link copied" : "Invite users"}
         </button>
+        {movieUrl ? (
+          <button
+            type="button"
+            onClick={() => {
+              setLinkModalError("");
+              setLinkModalMode("replace");
+              const u = movieUrlRef.current;
+              if (u.startsWith("http://") || u.startsWith("https://")) {
+                setLinkUrlInput(u);
+              } else {
+                setLinkUrlInput("");
+              }
+              setShowLinkModal(true);
+            }}
+            className="mt-2 w-full rounded-xl border border-white/80 bg-white/10 px-4 py-3 text-sm font-semibold text-white shadow-lg backdrop-blur-sm transition hover:bg-white/20 focus:outline-none focus-visible:ring-2 focus-visible:ring-white/70"
+          >
+            Change video from link
+          </button>
+        ) : null}
         {isLastUserInRoom ? (
           <button
             type="button"

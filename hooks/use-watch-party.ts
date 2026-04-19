@@ -39,7 +39,7 @@ const DEFAULT_PEER_RTC_CONFIG: RTCConfiguration = {
   ],
 };
 
-const MEDIA_SYNC_DEBOUNCE_MS = 120;
+const MEDIA_SYNC_DEBOUNCE_MS = 50;
 
 function isPartyVideoMessage(x: unknown): x is PartyVideoMessage {
   if (typeof x !== "object" || x === null || (x as { type?: string }).type !== "video") {
@@ -60,26 +60,27 @@ function isPartyVideoMessage(x: unknown): x is PartyVideoMessage {
 }
 
 function syncPeerOutboundMedia(peer: PeerInstance, outbound: MediaStream | null) {
-  const want =
-    outbound && outbound.getTracks().length > 0 ? new Set(outbound.getTracks()) : new Set<MediaStreamTrack>();
+  if (!outbound) {
+    return;
+  }
 
-  for (const stream of [...peer.streams]) {
-    for (const t of [...stream.getTracks()]) {
-      if (!want.has(t)) {
-        try {
-          peer.removeTrack(t, stream);
-        } catch {
-          /* ignore */
-        }
+  const want = new Set(outbound.getTracks());
+  const current = new Set(
+    peer.streams
+      .filter((s) => s.id === outbound.id)
+      .flatMap((s) => s.getTracks()),
+  );
+
+  for (const t of current) {
+    if (!want.has(t)) {
+      try {
+        peer.removeTrack(t, outbound);
+      } catch {
+        /* ignore */
       }
     }
   }
 
-  if (!outbound || want.size === 0) {
-    return;
-  }
-
-  const current = new Set(peer.streams.flatMap((s) => s.getTracks()));
   for (const t of outbound.getTracks()) {
     if (!current.has(t)) {
       try {
@@ -113,6 +114,8 @@ export function useWatchParty(options: {
   /** Single outbound stream object so addTrack/removeTrack stays consistent across the mesh. */
   const outboundStreamRef = useRef<MediaStream | null>(null);
   const mediaSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** ICE/SDP can arrive before the Peer exists; buffer per sender until the mesh is ready. */
+  const pendingSignalsRef = useRef<Map<string, PeerSignal[]>>(new Map());
 
   const onVideoPartyMessageRef = useRef<(msg: PartyVideoMessage) => void>(() => {});
 
@@ -135,7 +138,9 @@ export function useWatchParty(options: {
   const ensureOutboundStream = useCallback((): MediaStream | null => {
     const tracks: MediaStreamTrack[] = [];
     if (isMicOn && micStreamRef.current) {
-      tracks.push(...micStreamRef.current.getAudioTracks());
+      for (const t of micStreamRef.current.getAudioTracks()) {
+        tracks.push(t.clone());
+      }
     }
     if (isCameraOn && cameraStreamRef.current) {
       tracks.push(...cameraStreamRef.current.getVideoTracks());
@@ -146,9 +151,12 @@ export function useWatchParty(options: {
       if (s) {
         for (const t of [...s.getTracks()]) {
           s.removeTrack(t);
+          if (t.kind === "audio") {
+            t.stop();
+          }
         }
+        return s;
       }
-      outboundStreamRef.current = null;
       return null;
     }
 
@@ -161,6 +169,9 @@ export function useWatchParty(options: {
     for (const t of [...s.getTracks()]) {
       if (!tracks.includes(t)) {
         s.removeTrack(t);
+        if (t.kind === "audio") {
+          t.stop();
+        }
       }
     }
     for (const t of tracks) {
@@ -208,7 +219,13 @@ export function useWatchParty(options: {
           const target = myPeerIdRef.current;
           if (target && data.to === target) {
             const peer = peersRef.current.get(data.from);
-            peer?.signal(data.signal);
+            if (peer) {
+              peer.signal(data.signal);
+            } else {
+              const queued = pendingSignalsRef.current.get(data.from) ?? [];
+              queued.push(data.signal);
+              pendingSignalsRef.current.set(data.from, queued);
+            }
           }
         }
       } catch {
@@ -230,6 +247,7 @@ export function useWatchParty(options: {
       peersRef.current.clear();
       myPeerIdRef.current = null;
       outboundStreamRef.current = null;
+      pendingSignalsRef.current.clear();
       socket.close();
       socketRef.current = null;
       setMyPeerId(null);
@@ -291,6 +309,7 @@ export function useWatchParty(options: {
       };
 
       for (const remoteId of remotes) {
+        pendingSignalsRef.current.delete(remoteId);
         const opts: PeerOptions = {
           initiator: myId < remoteId,
           trickle: true,
@@ -333,6 +352,17 @@ export function useWatchParty(options: {
         });
 
         peersRef.current.set(remoteId, peer);
+        const queued = pendingSignalsRef.current.get(remoteId);
+        if (queued && queued.length > 0) {
+          for (const signal of queued) {
+            try {
+              peer.signal(signal);
+            } catch {
+              /* ignore */
+            }
+          }
+          pendingSignalsRef.current.delete(remoteId);
+        }
       }
     };
 
