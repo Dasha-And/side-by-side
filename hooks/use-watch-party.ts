@@ -59,19 +59,37 @@ function isPartyVideoMessage(x: unknown): x is PartyVideoMessage {
   return false;
 }
 
+function getPeerConnection(peer: PeerInstance): RTCPeerConnection | null {
+  const internal = peer as unknown as { _pc: RTCPeerConnection | null; destroyed?: boolean };
+  if (internal.destroyed || !internal._pc) {
+    return null;
+  }
+  return internal._pc;
+}
+
+/**
+ * Aligns RTCRtpSenders with `outbound`. We cannot use `peer.streams` here: simple-peer only copies
+ * `opts.stream` into `this.streams` at construction, so tracks added later via `addTrack` are
+ * invisible to `peer.streams`, which made `current` empty and caused duplicate `addTrack` to throw
+ * (caught) so outbound audio never attached reliably.
+ */
 function syncPeerOutboundMedia(peer: PeerInstance, outbound: MediaStream | null) {
+  const pc = getPeerConnection(peer);
+  if (!pc) {
+    return;
+  }
+
   if (!outbound) {
     return;
   }
 
   const want = new Set(outbound.getTracks());
-  const current = new Set(
-    peer.streams
-      .filter((s) => s.id === outbound.id)
-      .flatMap((s) => s.getTracks()),
-  );
+  const senderTracks = pc
+    .getSenders()
+    .map((s) => s.track)
+    .filter((t): t is MediaStreamTrack => t != null && t.readyState !== "ended");
 
-  for (const t of current) {
+  for (const t of senderTracks) {
     if (!want.has(t)) {
       try {
         peer.removeTrack(t, outbound);
@@ -81,8 +99,15 @@ function syncPeerOutboundMedia(peer: PeerInstance, outbound: MediaStream | null)
     }
   }
 
+  const stillSending = new Set(
+    pc
+      .getSenders()
+      .map((s) => s.track)
+      .filter((t): t is MediaStreamTrack => t != null && t.readyState !== "ended"),
+  );
+
   for (const t of outbound.getTracks()) {
-    if (!current.has(t)) {
+    if (!stillSending.has(t)) {
       try {
         peer.addTrack(t, outbound);
       } catch {
@@ -137,13 +162,40 @@ export function useWatchParty(options: {
 
   const ensureOutboundStream = useCallback((): MediaStream | null => {
     const tracks: MediaStreamTrack[] = [];
-    if (isMicOn && micStreamRef.current) {
-      for (const t of micStreamRef.current.getAudioTracks()) {
-        tracks.push(t.clone());
+    const existingOutbound = outboundStreamRef.current;
+
+    if (existingOutbound) {
+      if (isMicOn && micStreamRef.current) {
+        const live = existingOutbound.getAudioTracks().find((t) => t.readyState === "live");
+        if (live) {
+          tracks.push(live);
+        } else {
+          for (const t of micStreamRef.current.getAudioTracks()) {
+            tracks.push(t.clone());
+          }
+        }
       }
-    }
-    if (isCameraOn && cameraStreamRef.current) {
-      tracks.push(...cameraStreamRef.current.getVideoTracks());
+      if (isCameraOn && cameraStreamRef.current) {
+        const live = existingOutbound.getVideoTracks().find((t) => t.readyState === "live");
+        if (live) {
+          tracks.push(live);
+        } else {
+          for (const t of cameraStreamRef.current.getVideoTracks()) {
+            tracks.push(t.clone());
+          }
+        }
+      }
+    } else {
+      if (isMicOn && micStreamRef.current) {
+        for (const t of micStreamRef.current.getAudioTracks()) {
+          tracks.push(t.clone());
+        }
+      }
+      if (isCameraOn && cameraStreamRef.current) {
+        for (const t of cameraStreamRef.current.getVideoTracks()) {
+          tracks.push(t.clone());
+        }
+      }
     }
 
     if (tracks.length === 0) {
@@ -151,9 +203,7 @@ export function useWatchParty(options: {
       if (s) {
         for (const t of [...s.getTracks()]) {
           s.removeTrack(t);
-          if (t.kind === "audio") {
-            t.stop();
-          }
+          t.stop();
         }
         return s;
       }
@@ -169,9 +219,7 @@ export function useWatchParty(options: {
     for (const t of [...s.getTracks()]) {
       if (!tracks.includes(t)) {
         s.removeTrack(t);
-        if (t.kind === "audio") {
-          t.stop();
-        }
+        t.stop();
       }
     }
     for (const t of tracks) {
@@ -289,14 +337,21 @@ export function useWatchParty(options: {
         return next;
       });
 
-      for (const p of peersRef.current.values()) {
-        try {
-          p.destroy();
-        } catch {
-          /* ignore */
+      const desired = new Set(remotes);
+      for (const remoteId of [...peersRef.current.keys()]) {
+        if (!desired.has(remoteId)) {
+          const p = peersRef.current.get(remoteId);
+          if (p) {
+            try {
+              p.destroy();
+            } catch {
+              /* ignore */
+            }
+            peersRef.current.delete(remoteId);
+            pendingSignalsRef.current.delete(remoteId);
+          }
         }
       }
-      peersRef.current.clear();
 
       const outbound = ensureOutboundStreamRef.current();
 
@@ -309,7 +364,10 @@ export function useWatchParty(options: {
       };
 
       for (const remoteId of remotes) {
-        pendingSignalsRef.current.delete(remoteId);
+        if (peersRef.current.has(remoteId)) {
+          continue;
+        }
+
         const opts: PeerOptions = {
           initiator: myId < remoteId,
           trickle: true,
@@ -363,6 +421,11 @@ export function useWatchParty(options: {
           }
           pendingSignalsRef.current.delete(remoteId);
         }
+      }
+
+      const outboundFinal = ensureOutboundStreamRef.current();
+      for (const p of peersRef.current.values()) {
+        syncPeerOutboundMedia(p, outboundFinal);
       }
     };
 
